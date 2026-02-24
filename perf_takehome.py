@@ -66,9 +66,15 @@ DEPTH_4_VSELECT_GROUPS_BY_ROUND: dict[int, set[int]] = {}
 # Number of pairwise depth-3 leaves lowered via multiply_add in vselect tree.
 # Remaining leaves use flow/vselect directly.
 DEPTH_3_VSELECT_DIFF_PAIRS: int = 3
+# Optional round-specific overrides for depth-3 diff-pair count.
+# When a round key is present, it overrides DEPTH_3_VSELECT_DIFF_PAIRS.
+DEPTH_3_VSELECT_DIFF_PAIRS_BY_ROUND: dict[int, int] = {3: 4, 14: 3}
 # Number of pairwise depth-4 leaves lowered via multiply_add in vselect tree.
 # Remaining leaves use flow/vselect directly.
 DEPTH_4_VSELECT_DIFF_PAIRS: int = 2
+# Optional round-specific overrides for depth-4 diff-pair count.
+# When a round key is present, it overrides DEPTH_4_VSELECT_DIFF_PAIRS.
+DEPTH_4_VSELECT_DIFF_PAIRS_BY_ROUND: dict[int, int] = {4: 3, 15: 1}
 # Experimental depth-5 path: replace scatter loads with a vselect tree for
 # selected groups only. Empty set keeps baseline scatter behavior.
 DEPTH_5_VSELECT_GROUPS: set[int] = set()
@@ -1431,6 +1437,7 @@ class KernelBuilder:
         self, label: str, sources: list[tuple[Ref, int]],
         n_diff_pairs: int | None = None,
         xor_const: Ref | None = None,
+        emit_odd_for_diff_pairs: bool = False,
     ) -> tuple[dict[int, Ref], dict[int, Ref]]:
         """Broadcast values and compute pairwise diffs as needed.
 
@@ -1465,6 +1472,10 @@ class KernelBuilder:
                 diff[i] = self.emit(
                     f"{label}_diff_{i}", "valu",
                     ("vbroadcast", scalar_diff))
+                if emit_odd_for_diff_pairs:
+                    vec[2 * i + 1] = self.emit(
+                        f"{label}_vec_{2 * i + 1}", "valu",
+                        ("vbroadcast", other_ref))
             else:
                 vec[2 * i + 1] = self.emit(
                     f"{label}_vec_{2 * i + 1}", "valu",
@@ -1540,9 +1551,12 @@ class KernelBuilder:
             if REVERSE_TREE_BIT_ORDER_DEPTH_3:
                 d3_sources = _bit_reverse_permute(d3_sources, 3)
             d3_n_pairs = len(d3_sources) // 2
-            d3_n_diff_pairs = max(0, min(DEPTH_3_VSELECT_DIFF_PAIRS, d3_n_pairs))
+            d3_n_diff_pairs = max(
+                0, min(self._max_depth_diff_pairs(3), d3_n_pairs))
             tree_d3_vec, tree_d3_diff = self._emit_broadcast_and_diff(
-                "tree_d3", d3_sources, n_diff_pairs=d3_n_diff_pairs)
+                "tree_d3", d3_sources,
+                n_diff_pairs=d3_n_diff_pairs,
+                emit_odd_for_diff_pairs=bool(DEPTH_3_VSELECT_DIFF_PAIRS_BY_ROUND))
 
         tree_d4_vec: dict[int, Ref] = {}
         tree_d4_diff: dict[int, Ref] = {}
@@ -1561,9 +1575,12 @@ class KernelBuilder:
             if REVERSE_TREE_BIT_ORDER_DEPTH_4:
                 d4_sources = _bit_reverse_permute(d4_sources, 4)
             d4_n_pairs = len(d4_sources) // 2
-            d4_n_diff_pairs = max(0, min(DEPTH_4_VSELECT_DIFF_PAIRS, d4_n_pairs))
+            d4_n_diff_pairs = max(
+                0, min(self._max_depth_diff_pairs(4), d4_n_pairs))
             tree_d4_vec, tree_d4_diff = self._emit_broadcast_and_diff(
-                "tree_d4", d4_sources, n_diff_pairs=d4_n_diff_pairs)
+                "tree_d4", d4_sources,
+                n_diff_pairs=d4_n_diff_pairs,
+                emit_odd_for_diff_pairs=bool(DEPTH_4_VSELECT_DIFF_PAIRS_BY_ROUND))
 
         tree_mirror_base_vec: dict[int, Ref] = {}
         if ENABLE_STAGE5_TREE_FUSION:
@@ -1604,11 +1621,12 @@ class KernelBuilder:
                     d3_sources_inv = _bit_reverse_permute(d3_sources_inv, 3)
                 d3_inv_pairs = len(d3_sources_inv) // 2
                 d3_inv_diff_pairs = max(
-                    0, min(DEPTH_3_VSELECT_DIFF_PAIRS, d3_inv_pairs))
+                    0, min(self._max_depth_diff_pairs(3), d3_inv_pairs))
                 tree_d3_vec_xor5_inv, tree_d3_diff_xor5_inv = (
                     self._emit_broadcast_and_diff(
                         "tree_d3_x5inv", d3_sources_inv,
-                        n_diff_pairs=d3_inv_diff_pairs, xor_const=const5))
+                        n_diff_pairs=d3_inv_diff_pairs, xor_const=const5,
+                        emit_odd_for_diff_pairs=bool(DEPTH_3_VSELECT_DIFF_PAIRS_BY_ROUND)))
 
             if ENABLE_DEPTH_4_VSELECT:
                 d4_sources_inv = _bit_complement_permute(
@@ -1617,11 +1635,12 @@ class KernelBuilder:
                     d4_sources_inv = _bit_reverse_permute(d4_sources_inv, 4)
                 d4_inv_pairs = len(d4_sources_inv) // 2
                 d4_inv_diff_pairs = max(
-                    0, min(DEPTH_4_VSELECT_DIFF_PAIRS, d4_inv_pairs))
+                    0, min(self._max_depth_diff_pairs(4), d4_inv_pairs))
                 tree_d4_vec_xor5_inv, tree_d4_diff_xor5_inv = (
                     self._emit_broadcast_and_diff(
                         "tree_d4_x5inv", d4_sources_inv,
-                        n_diff_pairs=d4_inv_diff_pairs, xor_const=const5))
+                        n_diff_pairs=d4_inv_diff_pairs, xor_const=const5,
+                        emit_odd_for_diff_pairs=bool(DEPTH_4_VSELECT_DIFF_PAIRS_BY_ROUND)))
 
             # For scatter rounds under inverted branch semantics, convert
             # mirrored per-depth indices into true node addresses in one op:
@@ -1732,6 +1751,7 @@ class KernelBuilder:
         vec: dict[int, Ref],
         reduce_bits: list[Ref],
         start_deps: list[Ref] | None = None,
+        n_diff_pairs: int | None = None,
     ) -> Ref:
         """Build multiply_add leaves, then binary vselect reduction.
 
@@ -1742,7 +1762,11 @@ class KernelBuilder:
         """
         label = f"d{depth}"
         n_leaves = 1 << (depth - 1)
-        n_diff = len(diff)
+        n_diff_avail = len(diff)
+        if n_diff_pairs is None:
+            n_diff = n_diff_avail
+        else:
+            n_diff = max(0, min(n_diff_pairs, n_diff_avail))
 
         # First n_diff leaves: multiply_add on VALU engine
         current: list[Ref] = [
@@ -1845,6 +1869,7 @@ class KernelBuilder:
             return self.emit(f"{prefix}_tree_xor", "valu", ("^", values, nv))
 
         if depth == 3 and ENABLE_DEPTH_3_VSELECT and use_vselect_at_depth_3(g, rnd):
+            d3_diff_pairs = self._depth_diff_pairs(3, rnd)
             d3_diff = (
                 s.tree_d3_diff_xor5_inv
                 if (biased_prev and ENABLE_STAGE5_TREE_FUSION and s.tree_d3_diff_xor5_inv)
@@ -1858,11 +1883,13 @@ class KernelBuilder:
             if REVERSE_TREE_BIT_ORDER_DEPTH_3:
                 nv = self._emit_vselect_tree(
                     prefix, 3, bit0, d3_diff, d3_vec, [bit1, bit2],
-                    start_deps=first_deps)
+                    start_deps=first_deps,
+                    n_diff_pairs=d3_diff_pairs)
             else:
                 nv = self._emit_vselect_tree(
                     prefix, 3, bit2, d3_diff, d3_vec, [bit1, bit0],
-                    start_deps=first_deps)
+                    start_deps=first_deps,
+                    n_diff_pairs=d3_diff_pairs)
             if ENABLE_INPLACE_VECTOR_DATAFLOW:
                 return self.emit(
                     f"{prefix}_tree_xor", "valu", ("^", values, nv),
@@ -1870,6 +1897,7 @@ class KernelBuilder:
             return self.emit(f"{prefix}_tree_xor", "valu", ("^", values, nv))
 
         if depth == 4 and ENABLE_DEPTH_4_VSELECT and use_vselect_at_depth_4(g, rnd):
+            d4_diff_pairs = self._depth_diff_pairs(4, rnd)
             d4_diff = (
                 s.tree_d4_diff_xor5_inv
                 if (biased_prev and ENABLE_STAGE5_TREE_FUSION and s.tree_d4_diff_xor5_inv)
@@ -1883,11 +1911,13 @@ class KernelBuilder:
             if REVERSE_TREE_BIT_ORDER_DEPTH_4:
                 nv = self._emit_vselect_tree(
                     prefix, 4, bit0, d4_diff, d4_vec, [bit1, bit2, bit3],
-                    start_deps=first_deps)
+                    start_deps=first_deps,
+                    n_diff_pairs=d4_diff_pairs)
             else:
                 nv = self._emit_vselect_tree(
                     prefix, 4, bit3, d4_diff, d4_vec, [bit2, bit1, bit0],
-                    start_deps=first_deps)
+                    start_deps=first_deps,
+                    n_diff_pairs=d4_diff_pairs)
             if ENABLE_INPLACE_VECTOR_DATAFLOW:
                 return self.emit(
                     f"{prefix}_tree_xor", "valu", ("^", values, nv),
@@ -2067,6 +2097,27 @@ class KernelBuilder:
     @staticmethod
     def _round_depth(rnd: int, forest_height: int) -> int:
         return rnd if rnd <= forest_height else rnd - (forest_height + 1)
+
+    @staticmethod
+    def _depth_diff_pairs(depth: int, rnd: int | None = None) -> int:
+        if depth == 3:
+            if rnd is not None and rnd in DEPTH_3_VSELECT_DIFF_PAIRS_BY_ROUND:
+                return DEPTH_3_VSELECT_DIFF_PAIRS_BY_ROUND[rnd]
+            return DEPTH_3_VSELECT_DIFF_PAIRS
+        if depth == 4:
+            if rnd is not None and rnd in DEPTH_4_VSELECT_DIFF_PAIRS_BY_ROUND:
+                return DEPTH_4_VSELECT_DIFF_PAIRS_BY_ROUND[rnd]
+            return DEPTH_4_VSELECT_DIFF_PAIRS
+        return 0
+
+    @staticmethod
+    def _max_depth_diff_pairs(depth: int) -> int:
+        base = KernelBuilder._depth_diff_pairs(depth, None)
+        if depth == 3 and DEPTH_3_VSELECT_DIFF_PAIRS_BY_ROUND:
+            return max(base, max(DEPTH_3_VSELECT_DIFF_PAIRS_BY_ROUND.values()))
+        if depth == 4 and DEPTH_4_VSELECT_DIFF_PAIRS_BY_ROUND:
+            return max(base, max(DEPTH_4_VSELECT_DIFF_PAIRS_BY_ROUND.values()))
+        return base
 
     @staticmethod
     def _round_uses_index(depth: int, g: int, rnd: int) -> bool:
