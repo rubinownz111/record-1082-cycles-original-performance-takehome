@@ -105,12 +105,18 @@ GROUP_EMIT_ORDER_MODE: Literal["identity", "light_first", "heavy_first"] = "iden
 # These depths are load-heavy due to scatter path, so we cap their in-flight
 # groups independently from the global group window.
 DEEP_ROUND_DEPTH_THRESHOLD: int = 6
-# Best measured setting for selective deep gating on the submission case.
-MAX_CONCURRENT_DEEP_ROUNDS: int = 20
+# Deep gating is disabled by default; round-specific full-round gates below
+# outperformed deep-only gating in current best configuration.
+MAX_CONCURRENT_DEEP_ROUNDS: int = 0
 # Optional per-depth or per-round deep-gate overrides.
 # When present, override the global window for matching depth/round.
 DEEP_GATE_WINDOW_BY_DEPTH: dict[int, int] = {}
 DEEP_GATE_WINDOW_BY_ROUND: dict[int, int] = {}
+# Optional per-round/per-depth full-round interleaving windows.
+# These gates cap the number of in-flight groups for selected rounds/depths
+# using round-end tokens. A value of 0 disables gating.
+ROUND_GATE_WINDOW_BY_ROUND: dict[int, int] = {7: 28, 9: 24, 10: 28}
+ROUND_GATE_WINDOW_BY_DEPTH: dict[int, int] = {}
 # Experimental: use tree result vectors directly as deep-gate tokens instead of
 # emitting scalar ALU token ops.
 USE_VECTOR_DEEP_TOKENS: bool = False
@@ -2073,10 +2079,13 @@ class KernelBuilder:
         values: Ref, ts: TreeState, s: SetupRefs,
         need_bit: bool = True,
         update_index: bool = True,
-    ) -> None:
-        """Emit branch-bit + index update. Mutates *ts* in place."""
+    ) -> tuple[Ref | None, Ref | None]:
+        """Emit branch-bit + index update. Mutates *ts* in place.
+
+        Returns (branch_bit_ref, new_index_ref).
+        """
         if not need_bit and not update_index:
-            return
+            return None, None
 
         branch_bit = self.emit(
             f"{prefix}_branch_bit", "valu", ("%", values, s.two_vec))
@@ -2084,7 +2093,7 @@ class KernelBuilder:
         if need_bit:
             ts.set_bit(depth, branch_bit)
         if not update_index:
-            return
+            return branch_bit, None
 
         if depth == 0:
             ts.index = self.emit(
@@ -2093,6 +2102,7 @@ class KernelBuilder:
             ts.index = self.emit(
                 f"{prefix}_new_index", "valu",
                 ("multiply_add", s.two_vec, ts.index, branch_bit))
+        return branch_bit, ts.index
 
     @staticmethod
     def _round_depth(rnd: int, forest_height: int) -> int:
@@ -2155,6 +2165,14 @@ class KernelBuilder:
             return MAX_CONCURRENT_DEEP_ROUNDS
         return 0
 
+    @staticmethod
+    def _round_gate_window(rnd: int, depth: int) -> int:
+        if rnd in ROUND_GATE_WINDOW_BY_ROUND:
+            return ROUND_GATE_WINDOW_BY_ROUND[rnd]
+        if depth in ROUND_GATE_WINDOW_BY_DEPTH:
+            return ROUND_GATE_WINDOW_BY_DEPTH[depth]
+        return 0
+
     def build_kernel(
         self,
         forest_height: int,
@@ -2183,6 +2201,7 @@ class KernelBuilder:
 
         completed_stores: list[Ref] = []
         deep_round_tokens: dict[int, list[Ref]] = defaultdict(list)
+        round_tokens: dict[int, list[Ref]] = defaultdict(list)
 
         group_order = list(range(num_groups))
         if GROUP_EMIT_ORDER_MODE != "identity":
@@ -2246,8 +2265,13 @@ class KernelBuilder:
                 is_overflow = (depth == forest_height)
                 prefix = f"g{physical_g}_r{rnd}"
                 deep_window = self._deep_gate_window(rnd, depth)
+                round_window = self._round_gate_window(rnd, depth)
 
                 round_start_deps: list[Ref] = []
+                if round_window > 0 and logical_g >= round_window:
+                    round_start_deps.append(
+                        round_tokens[rnd][logical_g - round_window]
+                    )
                 if deep_window > 0 and logical_g >= deep_window:
                     round_start_deps.append(
                         deep_round_tokens[rnd][logical_g - deep_window]
@@ -2279,14 +2303,29 @@ class KernelBuilder:
                     prefix, tree_values, s,
                     include_stage5_const=not stage5_skip_const[rnd],
                 )
+                round_tail_refs: list[Ref] = [values]
 
                 if not is_overflow and rnd < rounds - 1:
                     update_index = future_index_needed[rnd]
                     need_bit = future_bit_needed[rnd]
-                    self._emit_index_update(
+                    branch_bit_ref, new_index_ref = self._emit_index_update(
                         prefix, depth, values, ts, s,
                         need_bit=need_bit,
                         update_index=update_index,
+                    )
+                    if branch_bit_ref is not None:
+                        round_tail_refs.append(branch_bit_ref)
+                    if new_index_ref is not None:
+                        round_tail_refs.append(new_index_ref)
+
+                if round_window > 0 and (logical_g + round_window) < num_groups:
+                    round_tokens[rnd].append(
+                        self.emit(
+                            f"{prefix}_round_gate_token",
+                            "alu",
+                            ("+", s.const_zero, s.const_zero),
+                            deps=round_tail_refs,
+                        )
                     )
 
             store_ref = self.emit(
