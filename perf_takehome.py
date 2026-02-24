@@ -114,7 +114,7 @@ def use_vselect_at_depth_3(g: int) -> bool:
 
 def use_vselect_at_depth_4(g: int) -> bool:
     """Which groups use vselect at depth 4 (vs scatter loads)."""
-    return g in {0, 3, 9, 12, 15, 18, 21, 22, 24, 27, 30}
+    return g in {0, 1, 3, 11, 12, 15, 18, 21, 22, 24, 25, 27, 30}
 
 
 def _bit_reverse_permute(sources: list, n_bits: int) -> list:
@@ -759,7 +759,18 @@ class Scheduler:
         else:
             for r in rejected:
                 heapq.heappush(alloc.vector_free, r)
-            return False
+            # Fallback: allocate a fresh vector block from the watermark.
+            # This avoids false negatives when all reusable free-list blocks
+            # collide with recently emitted bundles but fresh space is safe.
+            if alloc._vector_watermark - V < alloc._scalar_watermark:
+                return False
+            fresh = alloc._vector_watermark
+            fresh_block = set(range(fresh, fresh + V))
+            if fresh_block & used_addrs:
+                return False
+            alloc._vector_watermark -= V
+            alloc.peak_vector = min(alloc.peak_vector, fresh)
+            found = fresh
 
         if op.write_size == 0 or op.vbase < 0:
             return False
