@@ -61,8 +61,12 @@ DEPTH_3_VSELECT_GROUPS_OVERRIDE: set[int] = set()
 DEPTH_4_VSELECT_GROUPS_OVERRIDE: set[int] = set()
 # Optional round-specific overrides for depth-3/depth-4 vselect masks.
 # When a round key is present, that set is used for the matching round only.
-DEPTH_3_VSELECT_GROUPS_BY_ROUND: dict[int, set[int]] = {}
-DEPTH_4_VSELECT_GROUPS_BY_ROUND: dict[int, set[int]] = {}
+DEPTH_3_VSELECT_GROUPS_BY_ROUND: dict[int, set[int]] = {
+    3: {0, 1, 3, 4, 6, 7, 9, 10, 12, 13, 14, 15, 16, 17, 18, 19, 21, 22, 24, 25, 27, 28, 29, 30, 31},
+}
+DEPTH_4_VSELECT_GROUPS_BY_ROUND: dict[int, set[int]] = {
+    4: {0, 1, 3, 11, 12, 15, 18, 21, 22, 24, 25, 27, 28, 30},
+}
 # Number of pairwise depth-3 leaves lowered via multiply_add in vselect tree.
 # Remaining leaves use flow/vselect directly.
 DEPTH_3_VSELECT_DIFF_PAIRS: int = 3
@@ -96,6 +100,10 @@ ENABLE_STAGE5_TREE_FUSION: bool = False
 # Optional explicit round set for stage-5 const skipping when fusion is enabled.
 # Empty set keeps legacy behavior (skip stage-5 const on all non-final rounds).
 STAGE5_FUSION_SKIP_ROUNDS: set[int] = set()
+# When stage-5 fusion is enabled and STAGE5_FUSION_SKIP_ROUNDS is empty,
+# choose const skipping per-group based on whether the next round can absorb
+# the const without scatter compensation.
+STAGE5_FUSION_SELECTIVE_BY_PATH: bool = True
 MAX_CONCURRENT_GROUPS: int = 20
 # Optional logical emission ordering for groups.
 # The logical group id controls strategy masks and interleave gating.
@@ -122,6 +130,11 @@ ROUND_GATE_WINDOW_BY_DEPTH: dict[int, int] = {}
 USE_VECTOR_DEEP_TOKENS: bool = False
 # Experimental: enable full-vector in-place writes for tree/hash updates.
 ENABLE_INPLACE_VECTOR_DATAFLOW: bool = False
+# Experimental selective in-place controls; either can be enabled independently.
+ENABLE_INPLACE_TREE_XOR_DATAFLOW: bool = False
+ENABLE_INPLACE_HASH_DATAFLOW: bool = False
+# Reuse child vector buffers during vselect tree reductions.
+ENABLE_INPLACE_VSELECT_REDUCTION: bool = True
 BASELINE_CYCLES: int = 147734
 PRIORITY_RECOMPUTE_INTERVAL: int = 5
 
@@ -157,6 +170,12 @@ SCATTER_VECTOR_XOR_GROUPS: set[int] = set()
 # Engine choice for scalar constant materialization (except zero).
 # `flow` emits constants via add_imm from zero, reducing load pressure.
 CONST_NONZERO_ENGINE: Literal["load", "flow"] = "load"
+# Use per-group immediate address generation for input load/store base instead
+# of a serial `group_offset` ALU chain in setup.
+USE_IMMEDIATE_GROUP_LOAD_ADDR: bool = False
+# Recompute per-group store address near the final vstore instead of keeping
+# the initial load address live across all rounds.
+RECOMPUTE_STORE_ADDR_AT_TAIL: bool = False
 
 # Priority calculation scales
 CRITICAL_PATH_SCALE = 100.0
@@ -167,6 +186,7 @@ EMIT_ORDER_SCALE = 10.0
 # Optional scheduler telemetry output (disabled by default).
 # Set SCHED_TELEMETRY_PATH to a .csv or .jsonl path to enable.
 SCHED_TELEMETRY_PATH = os.getenv("SCHED_TELEMETRY_PATH", "").strip()
+DEBUG_STUCK_DUMP = os.getenv("DEBUG_STUCK_DUMP", "").strip() not in ("", "0", "false", "False")
 
 # ══════════════════════════════════════════════════════════════════════
 #  Type Definitions
@@ -241,6 +261,15 @@ def _bit_complement_permute(sources: list, n_bits: int) -> list:
     for i in range(n):
         result[i] = sources[(~i) & mask]
     return result
+
+
+def _bit_reverse_mask(mask: int, n_bits: int) -> int:
+    """Reverse lower n_bits of an integer mask."""
+    rev = 0
+    for b in range(n_bits):
+        if mask & (1 << b):
+            rev |= 1 << (n_bits - 1 - b)
+    return rev
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -905,6 +934,8 @@ class Scheduler:
         if op.vbase in alloc.vmap:
             return False
         alloc.vid_ownership[op.id] = (found, op.write_size)
+        alloc.vbase_owner[op.vbase] = op.id
+        alloc.owner_vbase[op.id] = op.vbase
         for k in range(op.write_size):
             alloc.vmap[op.vbase + k] = found + k
         return True
@@ -1166,6 +1197,27 @@ class Scheduler:
                       f"done {len(done_set)}/{n}, "
                       f"ready={len(ready)}, "
                       f"usage={alloc.current_usage}/{alloc.scratch_size}")
+                if DEBUG_STUCK_DUMP:
+                    print(
+                        "  alloc_state:",
+                        f"scalar_watermark={alloc._scalar_watermark}",
+                        f"vector_watermark={alloc._vector_watermark}",
+                        f"scalar_free={len(alloc.scalar_free)}",
+                        f"vector_free={len(alloc.vector_free)}",
+                        f"peak_usage={alloc.peak_usage}",
+                    )
+                    preview = sorted({idx for (_, _, idx) in ready})[:12]
+                    for ridx in preview:
+                        rop = ops[ridx]
+                        can = alloc.can_alloc(rop.write_size) if alloc.needs_new_alloc(rop) else True
+                        print(
+                            "  ready_op:",
+                            ridx, rop.id, rop.engine,
+                            f"write_size={rop.write_size}",
+                            f"needs_alloc={alloc.needs_new_alloc(rop)}",
+                            f"can_alloc={can}",
+                            f"earliest={earliest[ridx]}",
+                        )
                 break
 
         self._flush_telemetry()
@@ -1221,6 +1273,7 @@ class SetupRefs:
     fused_23_const_ha: Ref
     fused_23_mult_hb: Ref
     fused_23_const_hb: Ref
+    one_vec: Ref | None
     two_vec: Ref
     tree_base_1indexed: Ref
 
@@ -1249,6 +1302,7 @@ class KernelBuilder:
         self.vid_size: dict[str, int] = {}
         self.block_writers: dict[str, list[str]] = {}
         self._const_cache: dict[int, Ref] = {}
+        self._const_vec_cache: dict[int, Ref] = {}
 
     def debug_info(self) -> DebugInfo:
         return DebugInfo(scratch_map={})
@@ -1276,6 +1330,13 @@ class KernelBuilder:
             self.ops.append(Op(vid, slot, deps=deps, write_size=1, vbase=vaddr))
             self._const_cache[value] = Ref(vid)
         return self._const_cache[value]
+
+    def get_const_vec(self, value: int) -> Ref:
+        """Return a Ref to a broadcast vector constant, emitting once."""
+        if value not in self._const_vec_cache:
+            self._const_vec_cache[value] = self.emit(
+                f"const_vec_{value}", "valu", ("vbroadcast", self.get_const(value)))
+        return self._const_vec_cache[value]
 
     @staticmethod
     def _resolve_deps(deps: list[Ref] | None) -> list[str]:
@@ -1311,7 +1372,11 @@ class KernelBuilder:
             case "valu":
                 return VLEN
             case "flow":
-                return VLEN if op_name == "vselect" else 0
+                if op_name == "vselect":
+                    return VLEN
+                if op_name in ("add_imm", "select"):
+                    return 1
+                return 0
             case _:
                 assert_never(engine)
 
@@ -1492,19 +1557,29 @@ class KernelBuilder:
         """Emit all one-time setup ops. Returns typed SetupRefs."""
         V = VLEN
         if ENABLE_STAGE5_TREE_FUSION and DEPTH_5_VSELECT_GROUPS:
-            raise ValueError(
-                "ENABLE_STAGE5_TREE_FUSION does not currently support depth-5 vselect path")
+            # Depth-5 vselect path does not currently implement the
+            # stage5-fusion biased/inverted source variants.
+            # It is safe only when round 5 is never biased (i.e., round 4
+            # never skips stage-5 const).
+            if not STAGE5_FUSION_SKIP_ROUNDS:
+                raise ValueError(
+                    "ENABLE_STAGE5_TREE_FUSION + DEPTH_5_VSELECT_GROUPS requires explicit "
+                    "STAGE5_FUSION_SKIP_ROUNDS without round 4")
+            if 4 in STAGE5_FUSION_SKIP_ROUNDS:
+                raise ValueError(
+                    "round 4 skip biases round 5; unsupported for depth-5 vselect fusion path")
         const_zero = self.get_const(0)
         const_one = self.get_const(1)
         const_two = self.get_const(2)
         const_V = self.get_const(V)
 
         group_offset: dict[int, Ref] = {0: const_zero}
-        for g in range(1, num_groups):
-            group_offset[g] = self.emit(
-                f"group_offset_{g}", "alu",
-                ("+", group_offset[g - 1], const_V),
-            )
+        if not USE_IMMEDIATE_GROUP_LOAD_ADDR:
+            for g in range(1, num_groups):
+                group_offset[g] = self.emit(
+                    f"group_offset_{g}", "alu",
+                    ("+", group_offset[g - 1], const_V),
+                )
 
         for stage in (0, 1, 4, 5):
             self.get_const(HASH_STAGES[stage][1])
@@ -1718,6 +1793,9 @@ class KernelBuilder:
             "fused_23_const_hb", "valu",
             ("vbroadcast", self.get_const((C2 << 9) & 0xFFFFFFFF)))
 
+        one_vec: Ref | None = None
+        if ENABLE_STAGE5_TREE_FUSION:
+            one_vec = self.emit("one_vec", "valu", ("vbroadcast", const_one))
         two_vec = self.emit("two_vec", "valu", ("vbroadcast", const_two))
 
         return SetupRefs(
@@ -1746,6 +1824,7 @@ class KernelBuilder:
             fused_23_const_ha=fused_23_const_ha,
             fused_23_mult_hb=fused_23_mult_hb,
             fused_23_const_hb=fused_23_const_hb,
+            one_vec=one_vec,
             two_vec=two_vec,
             tree_base_1indexed=tree_base_1indexed,
         )
@@ -1795,7 +1874,8 @@ class KernelBuilder:
             current = [
                 self.emit(
                     f"{prefix}_{label}_r{level}_{i}", "flow",
-                    ("vselect", bit, current[2*i + 1], current[2*i]))
+                    ("vselect", bit, current[2*i + 1], current[2*i]),
+                    write_to=(current[2*i] if ENABLE_INPLACE_VSELECT_REDUCTION else None))
                 for i in range(len(current) // 2)
             ]
 
@@ -1807,11 +1887,29 @@ class KernelBuilder:
         values: Ref, ts: TreeState, s: SetupRefs,
         start_deps: list[Ref] | None = None,
         biased_prev: bool = False,
+        index_bias_mask: int = 0,
     ) -> Ref:
         """Emit tree node selection + XOR. Returns updated values Ref."""
         V = VLEN
+        use_inplace = ENABLE_INPLACE_VECTOR_DATAFLOW or ENABLE_INPLACE_TREE_XOR_DATAFLOW
         bit0, bit1, bit2, bit3, bit4 = ts.bits
         first_deps = start_deps or None
+        bit_unbias_cache: dict[int, Ref] = {}
+
+        def unbiased_bit(bit_ref: Ref | None, bit_depth: int) -> Ref:
+            assert bit_ref is not None
+            if not (ENABLE_STAGE5_TREE_FUSION and (index_bias_mask & (1 << bit_depth))):
+                return bit_ref
+            cached = bit_unbias_cache.get(bit_depth)
+            if cached is not None:
+                return cached
+            assert s.one_vec is not None
+            corrected = self.emit(
+                f"{prefix}_bit{bit_depth}_unbias", "valu",
+                ("^", bit_ref, s.one_vec),
+                deps=first_deps)
+            bit_unbias_cache[bit_depth] = corrected
+            return corrected
 
         if depth == 0:
             root_vec = (
@@ -1819,7 +1917,7 @@ class KernelBuilder:
                 if (biased_prev and ENABLE_STAGE5_TREE_FUSION and s.tree_root_vec_xor5 is not None)
                 else s.tree_root_vec
             )
-            if ENABLE_INPLACE_VECTOR_DATAFLOW:
+            if use_inplace:
                 return self.emit(
                     f"{prefix}_tree_xor", "valu",
                     ("^", values, root_vec),
@@ -1831,32 +1929,41 @@ class KernelBuilder:
                 deps=first_deps)
 
         if depth == 1:
-            if biased_prev and ENABLE_STAGE5_TREE_FUSION:
+            full_bias = (index_bias_mask & 0b1) == 0b1
+            if (biased_prev and ENABLE_STAGE5_TREE_FUSION and full_bias):
                 d1_hi = s.tree_d1_left_vec_xor5 or s.tree_d1_left_vec
                 d1_lo = s.tree_d1_right_vec_xor5 or s.tree_d1_right_vec
+                select_bit0 = bit0
             else:
                 d1_hi = s.tree_d1_right_vec
                 d1_lo = s.tree_d1_left_vec
+                select_bit0 = unbiased_bit(bit0, 0)
             nv = self.emit(
                 f"{prefix}_tree_select", "flow",
-                ("vselect", bit0, d1_hi, d1_lo),
+                ("vselect", select_bit0, d1_hi, d1_lo),
                 deps=first_deps)
-            if ENABLE_INPLACE_VECTOR_DATAFLOW:
+            if biased_prev and ENABLE_STAGE5_TREE_FUSION and not full_bias:
+                nv = self.emit(
+                    f"{prefix}_tree_select_bias_fix", "valu",
+                    ("^", nv, s.hash_const1_vec[5]))
+            if use_inplace:
                 return self.emit(
                     f"{prefix}_tree_xor", "valu", ("^", values, nv),
                     write_to=values)
             return self.emit(f"{prefix}_tree_xor", "valu", ("^", values, nv))
 
         if depth == 2:
-            d2_vec = (
-                s.tree_d2_vec_xor5_inv
-                if (biased_prev and ENABLE_STAGE5_TREE_FUSION and s.tree_d2_vec_xor5_inv)
-                else s.tree_d2_vec
+            full_bias = (index_bias_mask & 0b11) == 0b11
+            use_fast_bias = (
+                biased_prev and ENABLE_STAGE5_TREE_FUSION and full_bias and s.tree_d2_vec_xor5_inv
             )
+            d2_vec = s.tree_d2_vec_xor5_inv if use_fast_bias else s.tree_d2_vec
+            b0 = bit0 if use_fast_bias else unbiased_bit(bit0, 0)
+            b1 = bit1 if use_fast_bias else unbiased_bit(bit1, 1)
             if REVERSE_TREE_BIT_ORDER_DEPTH_2:
-                leaf_bit, reduce_bit = bit0, bit1
+                leaf_bit, reduce_bit = b0, b1
             else:
-                leaf_bit, reduce_bit = bit1, bit0
+                leaf_bit, reduce_bit = b1, b0
             sel0 = self.emit(
                 f"{prefix}_d2_sel0", "flow",
                 ("vselect", leaf_bit, d2_vec[1], d2_vec[0]),
@@ -1867,8 +1974,13 @@ class KernelBuilder:
                 deps=first_deps)
             nv = self.emit(
                 f"{prefix}_d2_select", "flow",
-                ("vselect", reduce_bit, sel1, sel0))
-            if ENABLE_INPLACE_VECTOR_DATAFLOW:
+                ("vselect", reduce_bit, sel1, sel0),
+                write_to=(sel0 if ENABLE_INPLACE_VSELECT_REDUCTION else None))
+            if biased_prev and ENABLE_STAGE5_TREE_FUSION and not use_fast_bias:
+                nv = self.emit(
+                    f"{prefix}_d2_select_bias_fix", "valu",
+                    ("^", nv, s.hash_const1_vec[5]))
+            if use_inplace:
                 return self.emit(
                     f"{prefix}_tree_xor", "valu", ("^", values, nv),
                     write_to=values)
@@ -1876,27 +1988,31 @@ class KernelBuilder:
 
         if depth == 3 and ENABLE_DEPTH_3_VSELECT and use_vselect_at_depth_3(g, rnd):
             d3_diff_pairs = self._depth_diff_pairs(3, rnd)
-            d3_diff = (
-                s.tree_d3_diff_xor5_inv
-                if (biased_prev and ENABLE_STAGE5_TREE_FUSION and s.tree_d3_diff_xor5_inv)
-                else s.tree_d3_diff
+            full_bias = (index_bias_mask & 0b111) == 0b111
+            use_fast_bias = (
+                biased_prev and ENABLE_STAGE5_TREE_FUSION and full_bias
+                and s.tree_d3_diff_xor5_inv and s.tree_d3_vec_xor5_inv
             )
-            d3_vec = (
-                s.tree_d3_vec_xor5_inv
-                if (biased_prev and ENABLE_STAGE5_TREE_FUSION and s.tree_d3_vec_xor5_inv)
-                else s.tree_d3_vec
-            )
+            d3_diff = s.tree_d3_diff_xor5_inv if use_fast_bias else s.tree_d3_diff
+            d3_vec = s.tree_d3_vec_xor5_inv if use_fast_bias else s.tree_d3_vec
+            b0 = bit0 if use_fast_bias else unbiased_bit(bit0, 0)
+            b1 = bit1 if use_fast_bias else unbiased_bit(bit1, 1)
+            b2 = bit2 if use_fast_bias else unbiased_bit(bit2, 2)
             if REVERSE_TREE_BIT_ORDER_DEPTH_3:
                 nv = self._emit_vselect_tree(
-                    prefix, 3, bit0, d3_diff, d3_vec, [bit1, bit2],
+                    prefix, 3, b0, d3_diff, d3_vec, [b1, b2],
                     start_deps=first_deps,
                     n_diff_pairs=d3_diff_pairs)
             else:
                 nv = self._emit_vselect_tree(
-                    prefix, 3, bit2, d3_diff, d3_vec, [bit1, bit0],
+                    prefix, 3, b2, d3_diff, d3_vec, [b1, b0],
                     start_deps=first_deps,
                     n_diff_pairs=d3_diff_pairs)
-            if ENABLE_INPLACE_VECTOR_DATAFLOW:
+            if biased_prev and ENABLE_STAGE5_TREE_FUSION and not use_fast_bias:
+                nv = self.emit(
+                    f"{prefix}_d3_select_bias_fix", "valu",
+                    ("^", nv, s.hash_const1_vec[5]))
+            if use_inplace:
                 return self.emit(
                     f"{prefix}_tree_xor", "valu", ("^", values, nv),
                     write_to=values)
@@ -1904,42 +2020,56 @@ class KernelBuilder:
 
         if depth == 4 and ENABLE_DEPTH_4_VSELECT and use_vselect_at_depth_4(g, rnd):
             d4_diff_pairs = self._depth_diff_pairs(4, rnd)
-            d4_diff = (
-                s.tree_d4_diff_xor5_inv
-                if (biased_prev and ENABLE_STAGE5_TREE_FUSION and s.tree_d4_diff_xor5_inv)
-                else s.tree_d4_diff
+            full_bias = (index_bias_mask & 0b1111) == 0b1111
+            use_fast_bias = (
+                biased_prev and ENABLE_STAGE5_TREE_FUSION and full_bias
+                and s.tree_d4_diff_xor5_inv and s.tree_d4_vec_xor5_inv
             )
-            d4_vec = (
-                s.tree_d4_vec_xor5_inv
-                if (biased_prev and ENABLE_STAGE5_TREE_FUSION and s.tree_d4_vec_xor5_inv)
-                else s.tree_d4_vec
-            )
+            d4_diff = s.tree_d4_diff_xor5_inv if use_fast_bias else s.tree_d4_diff
+            d4_vec = s.tree_d4_vec_xor5_inv if use_fast_bias else s.tree_d4_vec
+            b0 = bit0 if use_fast_bias else unbiased_bit(bit0, 0)
+            b1 = bit1 if use_fast_bias else unbiased_bit(bit1, 1)
+            b2 = bit2 if use_fast_bias else unbiased_bit(bit2, 2)
+            b3 = bit3 if use_fast_bias else unbiased_bit(bit3, 3)
             if REVERSE_TREE_BIT_ORDER_DEPTH_4:
                 nv = self._emit_vselect_tree(
-                    prefix, 4, bit0, d4_diff, d4_vec, [bit1, bit2, bit3],
+                    prefix, 4, b0, d4_diff, d4_vec, [b1, b2, b3],
                     start_deps=first_deps,
                     n_diff_pairs=d4_diff_pairs)
             else:
                 nv = self._emit_vselect_tree(
-                    prefix, 4, bit3, d4_diff, d4_vec, [bit2, bit1, bit0],
+                    prefix, 4, b3, d4_diff, d4_vec, [b2, b1, b0],
                     start_deps=first_deps,
                     n_diff_pairs=d4_diff_pairs)
-            if ENABLE_INPLACE_VECTOR_DATAFLOW:
+            if biased_prev and ENABLE_STAGE5_TREE_FUSION and not use_fast_bias:
+                nv = self.emit(
+                    f"{prefix}_d4_select_bias_fix", "valu",
+                    ("^", nv, s.hash_const1_vec[5]))
+            if use_inplace:
                 return self.emit(
                     f"{prefix}_tree_xor", "valu", ("^", values, nv),
                     write_to=values)
             return self.emit(f"{prefix}_tree_xor", "valu", ("^", values, nv))
 
         if depth == 5 and use_vselect_at_depth_5(g):
+            b0 = unbiased_bit(bit0, 0)
+            b1 = unbiased_bit(bit1, 1)
+            b2 = unbiased_bit(bit2, 2)
+            b3 = unbiased_bit(bit3, 3)
+            b4 = unbiased_bit(bit4, 4)
             if REVERSE_TREE_BIT_ORDER_DEPTH_5:
                 nv = self._emit_vselect_tree(
-                    prefix, 5, bit0, s.tree_d5_diff, s.tree_d5_vec,
-                    [bit1, bit2, bit3, bit4], start_deps=first_deps)
+                    prefix, 5, b0, s.tree_d5_diff, s.tree_d5_vec,
+                    [b1, b2, b3, b4], start_deps=first_deps)
             else:
                 nv = self._emit_vselect_tree(
-                    prefix, 5, bit4, s.tree_d5_diff, s.tree_d5_vec,
-                    [bit3, bit2, bit1, bit0], start_deps=first_deps)
-            if ENABLE_INPLACE_VECTOR_DATAFLOW:
+                    prefix, 5, b4, s.tree_d5_diff, s.tree_d5_vec,
+                    [b3, b2, b1, b0], start_deps=first_deps)
+            if biased_prev and ENABLE_STAGE5_TREE_FUSION:
+                nv = self.emit(
+                    f"{prefix}_d5_select_bias_fix", "valu",
+                    ("^", nv, s.hash_const1_vec[5]))
+            if use_inplace:
                 return self.emit(
                     f"{prefix}_tree_xor", "valu", ("^", values, nv),
                     write_to=values)
@@ -1949,16 +2079,21 @@ class KernelBuilder:
         if first_deps:
             scatter_deps.extend(first_deps)
         scatter = self.alloc_vec(f"{prefix}_scatter", deps=scatter_deps)
-        if biased_prev and ENABLE_STAGE5_TREE_FUSION and depth in s.tree_mirror_base_vec:
-            addr = self.emit(
-                f"{prefix}_tree_base_mirror", "valu",
-                ("-", s.tree_mirror_base_vec[depth], ts.index),
-                deps=first_deps)
-        else:
-            addr = self.emit(
-                f"{prefix}_tree_base_1indexed", "valu",
-                ("+", s.tree_base_1indexed, ts.index),
-                deps=first_deps)
+        corrected_index = ts.index
+        addr_deps = first_deps
+        if ENABLE_STAGE5_TREE_FUSION and depth > 0:
+            depth_prefix_mask = index_bias_mask & ((1 << depth) - 1)
+            if depth_prefix_mask:
+                idx_mask = _bit_reverse_mask(depth_prefix_mask, depth)
+                corrected_index = self.emit(
+                    f"{prefix}_idx_unbias", "valu",
+                    ("^", ts.index, self.get_const_vec(idx_mask)),
+                    deps=first_deps)
+                addr_deps = None
+        addr = self.emit(
+            f"{prefix}_tree_base_1indexed", "valu",
+            ("+", s.tree_base_1indexed, corrected_index),
+            deps=addr_deps)
         if SCATTER_VECTOR_XOR:
             if SCATTER_VECTOR_XOR_DEPTHS and depth not in SCATTER_VECTOR_XOR_DEPTHS:
                 use_vec_scatter = False
@@ -2006,6 +2141,7 @@ class KernelBuilder:
         include_stage5_const: bool = True,
     ) -> Ref:
         """Emit the 6-stage hash. Returns updated values Ref."""
+        use_inplace = ENABLE_INPLACE_VECTOR_DATAFLOW or ENABLE_INPLACE_HASH_DATAFLOW
         for stage in range(6):
             op1, _v1, op2, op3, _v3 = HASH_STAGES[stage]
             if stage == 2:
@@ -2020,7 +2156,7 @@ class KernelBuilder:
                     f"{prefix}_hash23_b", "valu",
                     ("multiply_add", values,
                      s.fused_23_mult_hb, s.fused_23_const_hb))
-                if ENABLE_INPLACE_VECTOR_DATAFLOW:
+                if use_inplace:
                     values = self.emit(
                         f"{prefix}_hash23_combine", "valu",
                         ("^", ha, hb),
@@ -2032,7 +2168,7 @@ class KernelBuilder:
             elif stage == 3:
                 continue  # handled in stage 2
             elif stage in (0, 4):
-                if ENABLE_INPLACE_VECTOR_DATAFLOW:
+                if use_inplace:
                     values = self.emit(
                         f"{prefix}_hash{stage}", "valu",
                         ("multiply_add", values,
@@ -2050,7 +2186,7 @@ class KernelBuilder:
                     f"{prefix}_hash{stage}_b", "valu",
                     (op3, values, s.hash_const3_vec[stage]))
                 if stage == 5 and not include_stage5_const:
-                    if ENABLE_INPLACE_VECTOR_DATAFLOW:
+                    if use_inplace:
                         values = self.emit(
                             f"{prefix}_hash{stage}_combine", "valu",
                             (op2, values, hb),
@@ -2063,7 +2199,7 @@ class KernelBuilder:
                 ha = self.emit(
                     f"{prefix}_hash{stage}_a", "valu",
                     (op1, values, s.hash_const1_vec[stage]))
-                if ENABLE_INPLACE_VECTOR_DATAFLOW:
+                if use_inplace:
                     values = self.emit(
                         f"{prefix}_hash{stage}_combine", "valu",
                         (op2, ha, hb),
@@ -2142,6 +2278,19 @@ class KernelBuilder:
         return True
 
     @staticmethod
+    def _round_uses_scatter(depth: int, g: int, rnd: int) -> bool:
+        """Return True when tree selection at this round uses scatter path."""
+        if depth <= 2:
+            return False
+        if depth == 3 and ENABLE_DEPTH_3_VSELECT and use_vselect_at_depth_3(g, rnd):
+            return False
+        if depth == 4 and ENABLE_DEPTH_4_VSELECT and use_vselect_at_depth_4(g, rnd):
+            return False
+        if depth == 5 and use_vselect_at_depth_5(g):
+            return False
+        return True
+
+    @staticmethod
     def _tree_consumed_bits(depth: int, g: int, rnd: int) -> tuple[int, ...]:
         if depth == 1:
             return (0,)
@@ -2184,18 +2333,6 @@ class KernelBuilder:
         num_groups = batch_size // V
 
         round_depths = [self._round_depth(rnd, forest_height) for rnd in range(rounds)]
-        stage5_skip_const: list[bool] = [False] * rounds
-        if ENABLE_STAGE5_TREE_FUSION:
-            if STAGE5_FUSION_SKIP_ROUNDS:
-                for rnd in range(max(0, rounds - 1)):
-                    if rnd in STAGE5_FUSION_SKIP_ROUNDS:
-                        stage5_skip_const[rnd] = True
-            else:
-                for rnd in range(max(0, rounds - 1)):
-                    stage5_skip_const[rnd] = True
-        stage5_biased_prev: list[bool] = [False] * rounds
-        for rnd in range(1, rounds):
-            stage5_biased_prev[rnd] = stage5_skip_const[rnd - 1]
 
         s = self._emit_setup(num_groups, forest_height)
 
@@ -2250,15 +2387,30 @@ class KernelBuilder:
                 [completed_stores[logical_g - MAX_CONCURRENT_GROUPS]]
                 if logical_g >= MAX_CONCURRENT_GROUPS else [])
 
-            load_addr = self.emit(
-                f"group{physical_g}_load_addr", "alu",
-                ("+", s.inp_values_ptr, s.group_offset[physical_g]),
-                deps=concurrency_deps)
-            values = self.emit(f"group{physical_g}_values", "load", ("vload", load_addr))
+            if USE_IMMEDIATE_GROUP_LOAD_ADDR:
+                imm = physical_g * V
+                if imm == 0 and not concurrency_deps:
+                    load_addr_in = s.inp_values_ptr
+                else:
+                    load_addr_in = self.emit(
+                        f"group{physical_g}_load_addr", "flow",
+                        ("add_imm", s.inp_values_ptr, imm),
+                        deps=concurrency_deps)
+            else:
+                load_addr_in = self.emit(
+                    f"group{physical_g}_load_addr", "alu",
+                    ("+", s.inp_values_ptr, s.group_offset[physical_g]),
+                    deps=concurrency_deps)
+            values = self.emit(
+                f"group{physical_g}_values", "load", ("vload", load_addr_in))
 
             ts = TreeState()
             future_index_needed = compute_future_index_needed(logical_g)
             future_bit_needed = compute_future_bit_needed(logical_g)
+            prev_stage5_skipped = False
+            # Bitmask of branch-bit depths currently inverted in ts.index/ts.bits
+            # due to stage-5 const skipping on their defining rounds.
+            index_bias_mask = 0
 
             for rnd in range(rounds):
                 depth = round_depths[rnd]
@@ -2280,7 +2432,8 @@ class KernelBuilder:
                 tree_values = self._emit_tree_xor(
                     prefix, depth, logical_g, rnd, values, ts, s,
                     start_deps=round_start_deps,
-                    biased_prev=stage5_biased_prev[rnd],
+                    biased_prev=prev_stage5_skipped,
+                    index_bias_mask=index_bias_mask,
                 )
 
                 if deep_window > 0 and (logical_g + deep_window) < num_groups:
@@ -2299,10 +2452,42 @@ class KernelBuilder:
                             )
                         )
 
+                skip_stage5_const = False
+                if ENABLE_STAGE5_TREE_FUSION and rnd < rounds - 1:
+                    if STAGE5_FUSION_SKIP_ROUNDS:
+                        skip_stage5_const = rnd in STAGE5_FUSION_SKIP_ROUNDS
+                    elif STAGE5_FUSION_SELECTIVE_BY_PATH:
+                        next_depth = round_depths[rnd + 1]
+                        next_uses_scatter = self._round_uses_scatter(
+                            next_depth, logical_g, rnd + 1)
+                        skip_stage5_const = not next_uses_scatter
+                        if skip_stage5_const:
+                            # The current vselect fusion fast-path for depth 1-4
+                            # assumes consumed branch bits are fully inverted.
+                            # If the next round would see a partial inversion
+                            # mask, keep stage-5 const to preserve correctness.
+                            consumed = self._tree_consumed_bits(
+                                next_depth, logical_g, rnd + 1)
+                            if consumed:
+                                next_bias_mask = index_bias_mask
+                                will_emit_branch = (
+                                    (not is_overflow)
+                                    and (future_index_needed[rnd] or future_bit_needed[rnd])
+                                )
+                                if will_emit_branch:
+                                    next_bias_mask |= (1 << depth)
+                                for bit_depth in consumed:
+                                    if not (next_bias_mask & (1 << bit_depth)):
+                                        skip_stage5_const = False
+                                        break
+                    else:
+                        skip_stage5_const = True
+
                 values = self._emit_hash(
                     prefix, tree_values, s,
-                    include_stage5_const=not stage5_skip_const[rnd],
+                    include_stage5_const=not skip_stage5_const,
                 )
+                prev_stage5_skipped = skip_stage5_const
                 round_tail_refs: list[Ref] = [values]
 
                 if not is_overflow and rnd < rounds - 1:
@@ -2315,6 +2500,11 @@ class KernelBuilder:
                     )
                     if branch_bit_ref is not None:
                         round_tail_refs.append(branch_bit_ref)
+                        bit_mask = 1 << depth
+                        if skip_stage5_const:
+                            index_bias_mask |= bit_mask
+                        else:
+                            index_bias_mask &= ~bit_mask
                     if new_index_ref is not None:
                         round_tail_refs.append(new_index_ref)
 
@@ -2328,8 +2518,27 @@ class KernelBuilder:
                         )
                     )
 
+            if RECOMPUTE_STORE_ADDR_AT_TAIL:
+                if USE_IMMEDIATE_GROUP_LOAD_ADDR:
+                    imm = physical_g * V
+                    if imm == 0:
+                        store_addr = s.inp_values_ptr
+                    else:
+                        store_addr = self.emit(
+                            f"group{physical_g}_store_addr", "flow",
+                            ("add_imm", s.inp_values_ptr, imm),
+                            deps=[values],
+                        )
+                else:
+                    store_addr = self.emit(
+                        f"group{physical_g}_store_addr", "alu",
+                        ("+", s.inp_values_ptr, s.group_offset[physical_g]),
+                        deps=[values],
+                    )
+            else:
+                store_addr = load_addr_in
             store_ref = self.emit(
-                f"group{physical_g}_store", "store", ("vstore", load_addr, values))
+                f"group{physical_g}_store", "store", ("vstore", store_addr, values))
             completed_stores.append(store_ref)
 
         print(f"Emitted {len(self.ops)} ops")
