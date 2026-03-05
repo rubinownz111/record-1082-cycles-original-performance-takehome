@@ -103,6 +103,13 @@
 - adding the narrow pointer-derivation rewrite on top of the same depth-5 vector-scatter family reaches `load=2000`, `alu=12003`, `valu=5994`, `flow=785`, `store=32`, `11908 ops`, but still measures `1067` cycles.
 - Extending vector scatter to depths `{5,6}` can push ALU fully below the old `12000` target (`alu=11955`, `load=2000`, `valu=6000`), yet still remains at `1068`.
 - Implication: this reopened vector-scatter family is no longer blocked by static slot counts alone; its remaining cap is schedule overlap / dependency shape, not just raw `load` or `alu` totals.
+- New fusion lead from that reopened family:
+- the generic stage-5 fusion path paid for deep-round repair too late (`idx_unbias` + post-scatter bias-fix), but the specific `round 4 -> round 5` transition has only one flipped branch bit and depth-5 is a pure scatter round in the current near-win family.
+- That enables a narrower critical-path rewrite: skip stage-5 const only on round `4`, then in round `5` repair `values` before the scatter combine (`values ^ const5`) so the repair can overlap with depth-5 loads, while correcting the depth-5 address with the known one-bit xor mask.
+- Implication: if any new fusion can still help this branch, this is the most plausible one because it removes the repair op from the post-load critical path instead of only changing slot totals.
+- The narrow `round 4 -> round 5` fusion did not survive contact with the scheduler:
+- even with pointer-derivation, wrap-root, full writeback, and the reopened depth-5/6 vector-scatter family, the pre-bias repair path regressed badly (`1090-1092` cycles) and pushed `valu` back above `6000`.
+- Implication: the remaining limiter in the reopened vector-scatter family is not just where the repair op sits on the depth-5 chain; skipping stage-5 const before the deep rounds still perturbs overlap enough to lose far more than it saves.
 - Deep tree traversal is the main load hotspot:
 - Depths `5-10` use scatter path and contribute most scalar `load`+`alu` tree ops.
 - New allocator/scheduler finding on the hash-temp reuse path:
@@ -124,6 +131,20 @@
 - Decision: stop brute-force knob tuning and focus on architectural changes.
 
 ## Attempt Log
+- 2026-03-05: Narrow round-4 -> round-5 stage-5 fusion for the reopened vector-scatter family.
+- What changed/tested:
+- Added a one-round fusion path that skips stage-5 const only on round `4`, then repairs round `5` by:
+- correcting the known one flipped depth-5 index bit
+- and pre-biasing `values` before the depth-5 scatter combine so the repair can overlap with the loads
+- Tested it on the strongest reopened vector-scatter compositions:
+- depth-5 vector scatter + wrap-root + full writeback + derived `inp_values_ptr`
+- depth-5/6 vector scatter + wrap-root + full writeback + derived `inp_values_ptr` with no round gates
+- Why: this was the cleanest remaining critical-path fusion idea after the generic stage-5 framework proved too heavy; the repair could happen before the scatter combine instead of after it.
+- Result:
+- `ENABLE_D5_SCATTER_STAGE5_FUSION=True` on the depth-5 vector-scatter near-win -> `1092` cycles, `11941` ops, `load=2000`, `alu=12099`, `valu=6015`, `flow=785`, peak scratch `1528/1536`.
+- Same fusion on the depth-5/6 no-gate vector-scatter family -> `1090` cycles, `11733` ops, `load=2000`, `alu=11979`, `valu=6028`, `flow=785`, peak scratch `1526/1536`.
+- Decision: revert / keep disabled. This fusion changes the critical path in the intended place, but the overall overlap disruption is severe enough that it is non-competitive.
+
 - 2026-03-05: Reopened delayed depth-5 near-miss under the scheduler offload fix.
 - What changed/tested:
 - Re-tested the historical delayed depth-5 near-miss config:

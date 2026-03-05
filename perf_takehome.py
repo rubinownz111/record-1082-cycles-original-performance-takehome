@@ -1799,7 +1799,8 @@ class KernelBuilder:
         """Emit all one-time setup ops. Returns typed SetupRefs."""
         V = VLEN
         if ENABLE_STAGE5_TREE_FUSION and (
-            ENABLE_WRAP_ROOT_STAGE5_FUSION or ENABLE_TAIL_SHALLOW_STAGE5_FUSION
+            ENABLE_WRAP_ROOT_STAGE5_FUSION
+            or ENABLE_TAIL_SHALLOW_STAGE5_FUSION
         ):
             raise ValueError(
                 "Specialized stage-5 fusion flags cannot be combined with ENABLE_STAGE5_TREE_FUSION")
@@ -2352,11 +2353,9 @@ class KernelBuilder:
                     write_to=values)
             return self.emit(f"{prefix}_tree_xor", "valu", ("^", values, nv))
 
-        scatter_deps = [ts.index, values]
-        if first_deps:
-            scatter_deps.extend(first_deps)
         corrected_index = ts.index
         addr_deps = first_deps
+        scatter_values = values
         if ENABLE_STAGE5_TREE_FUSION and depth > 0:
             depth_prefix_mask = index_bias_mask & ((1 << depth) - 1)
             if depth_prefix_mask:
@@ -2366,6 +2365,9 @@ class KernelBuilder:
                     ("^", ts.index, self.get_const_vec(idx_mask)),
                     deps=first_deps)
                 addr_deps = None
+        scatter_deps = [corrected_index, scatter_values]
+        if first_deps:
+            scatter_deps.extend(first_deps)
         addr = self.emit(
             f"{prefix}_tree_base_1indexed", "valu",
             ("+", s.tree_base_1indexed, corrected_index),
@@ -2395,8 +2397,8 @@ class KernelBuilder:
                 scatter_out = self.emit(
                     f"{prefix}_scat_xor_vec_to_values",
                     "valu",
-                    ("^", values, scatter),
-                    write_to=values)
+                    ("^", scatter_values, scatter),
+                    write_to=scatter_values)
             else:
                 scatter_out = self.emit(
                     (
@@ -2405,7 +2407,7 @@ class KernelBuilder:
                         else f"{prefix}_scat_xor_vec"
                     ),
                     "valu",
-                    ("^", values, scatter),
+                    ("^", scatter_values, scatter),
                     write_to=(scatter if SCATTER_VECTOR_XOR_INPLACE else None))
             if biased_prev and ENABLE_STAGE5_TREE_FUSION:
                 return self.emit(
@@ -2423,9 +2425,9 @@ class KernelBuilder:
                     ("load", addr.with_offset(elem)))
                 self.emit(
                     f"{prefix}_scat_xor_{elem}", "alu",
-                    ("^", values.with_offset(elem), loaded),
-                    write_to=values.with_offset(elem))
-            return values
+                    ("^", scatter_values.with_offset(elem), loaded),
+                    write_to=scatter_values.with_offset(elem))
+            return scatter_values
 
         assert scatter is not None
         for elem in range(V):
@@ -2434,7 +2436,7 @@ class KernelBuilder:
                 ("load", addr.with_offset(elem)))
             self.emit(
                 f"{prefix}_scat_xor_{elem}", "alu",
-                ("^", values.with_offset(elem), loaded),
+                ("^", scatter_values.with_offset(elem), loaded),
                 write_to=scatter.with_offset(elem))
         if biased_prev and ENABLE_STAGE5_TREE_FUSION:
             return self.emit(
