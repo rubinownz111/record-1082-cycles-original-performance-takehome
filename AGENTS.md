@@ -130,6 +130,12 @@
 - Narrow setup specialization interacts differently with the reopened families than it did on baseline:
 - specializing `forest_values_ptr` and `inp_values_ptr` directly is still terrible on baseline (`1070`), but on the reopened vector-scatter families it consistently removes one more real load (`1999`) and can pull ALU well below `12000` without losing correctness.
 - Implication: future work should continue to evaluate setup specialization only together with the reopened vector-scatter architecture, not in isolation.
+- New tied family from this pass:
+- guarded ALU offload on the depth-5 writeback combine plus the mixed depth-5/depth-6 vector-scatter layout still only ties at `1065`, but it shifts the static shape to `load=1999`, `flow=786`, `alu=11892-11894`, `valu=6006`.
+- Implication: we now have multiple distinct `1065` architectures with materially lower `load` and `alu` than baseline; the missing win is still overlap, not slot-count blindness.
+- Chunked deep-round tiling is now ruled out for this branch:
+- even when restricted to one deep round (`5` or `6`) or aimed at the public `group≈17 / round_tile≈13` style, round-major tiling inside concurrency-sized chunks regressed heavily (`1086+`, often `1090+`).
+- Implication: the strongest remaining families still want group-major emission, even when the deep rounds themselves are rewritten.
 - Deep tree traversal is the main load hotspot:
 - Depths `5-10` use scatter path and contribute most scalar `load`+`alu` tree ops.
 - New allocator/scheduler finding on the hash-temp reuse path:
@@ -151,6 +157,73 @@
 - Decision: stop brute-force knob tuning and focus on architectural changes.
 
 ## Attempt Log
+- 2026-03-06: Decomposed deep-round index update (`2*index + branch_bit`) into vector adds.
+- What changed/tested:
+- Added `DECOMPOSE_INDEX_UPDATE_DEPTHS` so selected depths replace the single VALU `multiply_add` in `_emit_index_update()` with two offloadable vector adds.
+- Tested on the strongest mixed family for:
+- depths `{5,6}`
+- depths `{5,6,7,8,9}`
+- Why: the mixed family finally has ALU headroom and slightly elevated VALU, so moving deep index-update work off VALU was a plausible tail optimization.
+- Result:
+- depths `{5,6}` -> `1068`, `11763` ops, `load=1999`, `flow=786`, `alu=11986`, `valu=6058`, `store=32`.
+- depths `{5,6,7,8,9}` -> `1076`, `11859` ops, `alu=12274`, `valu=6118`.
+- Decision: keep disabled. The extra vector-add chain costs more than it saves.
+
+- 2026-03-06: Chunked deep-round partial round-major tiling.
+- What changed/tested:
+- Added `ROUND_MAJOR_TILE_RANGE` so selected rounds can be emitted round-major within concurrency-sized group chunks while the rest of the kernel remains group-major.
+- Tested on the strongest mixed family for:
+- tile `5..6`
+- tile `5`
+- tile `6`
+- external-inspired point `MAX_CONCURRENT_GROUPS=17`, tile `0..12`
+- Why: import the public “group tile + round tile” idea in the narrowest way that preserves current group-cap semantics.
+- Result:
+- tile `5..6` -> `1092`.
+- tile `5` -> `1086`.
+- tile `6` -> `1093`.
+- `17 / 0..12` style point -> `1146`.
+- Decision: keep the scaffold available but disabled. Tiling deep rounds inside chunks is non-competitive on this branch.
+
+- 2026-03-06: Specialized setup + reopened vector-scatter family retests.
+- What changed/tested:
+- Added `SPECIALIZE_FOREST_VALUES_PTR` and `SPECIALIZE_INPUT_VALUES_PTR`.
+- Re-tested reopened vector-scatter families with specialized pointers:
+- depth `5` vector scatter
+- depth `6` only
+- depth `7` only
+- depths `{6,7}`
+- and one-group delayed depth-5-vselect hybrids on top of the strongest depth-5 vector-scatter family.
+- Why: setup specialization had become harmful on the baseline but might be net-positive only on the lower-scratch reopened families.
+- Result:
+- strongest depth-5 family with both pointer specializations -> `1067`, `load=1999`, `alu=11978`, `valu=5997`.
+- depth `6` only family with both specializations -> `1067`, `load=1999`, `alu=12010`, `valu=5991`.
+- depth `7` only / `{6,7}` families -> `1072`.
+- one-group delayed depth-5 hybrid re-test remained regressive (`1070+`).
+- Decision: keep both setup-specialization scaffolds, but only as companions for the reopened vector-scatter family; they are still wrong for the plain baseline.
+
+- 2026-03-06: Mixed depth-5/depth-6 vector-scatter family follow-ups.
+- What changed/tested:
+- Continued from the tied mixed family:
+- `depth 5 -> write_to_values`, `depth 6 -> plain`
+- specialized pointers
+- wrap-root fusion
+- full writeback chain
+- hash temp reuse
+- Tested nearby follow-ups:
+- `ROUND_GATE_WINDOW_BY_ROUND={5:28}`, `{5:29}`, `{5:30}`
+- `ROUND_GATE_WINDOW_BY_ROUND={7:28,9:24,10:28}`
+- `ROUND_GATE_RELEASE_AFTER_HASH_ROUNDS={5}`
+- guarded offload enabled for scatter writeback (`ALLOW_OFFLOAD_SCATTER_VEC_WRITEBACK=True`)
+- Why: once the mixed family tied baseline, only a few local overlap variants remained worth checking.
+- Result:
+- base mixed family -> correctness pass, `1065`, `11699` ops, `load=1999`, `flow=786`, `alu=11834`, `valu=6013`, `store=32`.
+- with guarded scatter-writeback offload and gate `{5:28}` -> `1065`, `11703` ops, `alu=11894`, `valu=6006`.
+- same family with gates `{5:29}` and `{5:30}` -> both `1065`, `11702/11701` ops, `alu=11893/11892`, `valu=6006`.
+- adding hash-release on round `5` stayed tied at `1065`.
+- baseline gate map `{7:28,9:24,10:28}` stayed `1067`.
+- Decision: keep the new per-depth placement and guarded scatter-writeback offload scaffolding, but none of the local overlap tweaks breaks below `1065`.
+
 - 2026-03-05: Mixed depth-5/depth-6 vector-scatter placement.
 - What changed/tested:
 - Added depth-filtered vector-scatter placement controls so depth-5 and depth-6 can choose different combine destinations.
