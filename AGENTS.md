@@ -133,6 +133,14 @@
 - New tied family from this pass:
 - guarded ALU offload on the depth-5 writeback combine plus the mixed depth-5/depth-6 vector-scatter layout still only ties at `1065`, but it shifts the static shape to `load=1999`, `flow=786`, `alu=11892-11894`, `valu=6006`.
 - Implication: we now have multiple distinct `1065` architectures with materially lower `load` and `alu` than baseline; the missing win is still overlap, not slot-count blindness.
+- The tied floor is now robust across several local variants of the same mixed family:
+- `SPECIALIZE_FOREST_VALUES_PTR + SPECIALIZE_INPUT_VALUES_PTR`
+- `SPECIALIZE_FOREST_VALUES_PTR + DERIVE_INPUT_VALUES_PTR_FROM_FOREST_PTR`
+- `ROUND_GATE_WINDOW_BY_ROUND={5:28/29/30}`
+- guarded scatter-writeback offload on or off
+- and even broader `write_to_values` placement across depths `{5,6}`
+- all repeatedly converge to correctness-valid `1065` rather than opening a new win.
+- Implication: the current branch is no longer missing a tiny placement/gate/offload interaction around the mixed vector-scatter family; beating `1065` now likely needs a qualitatively different dependency graph rather than another local perturbation of this one.
 - Chunked deep-round tiling is now ruled out for this branch:
 - even when restricted to one deep round (`5` or `6`) or aimed at the public `group≈17 / round_tile≈13` style, round-major tiling inside concurrency-sized chunks regressed heavily (`1086+`, often `1090+`).
 - Implication: the strongest remaining families still want group-major emission, even when the deep rounds themselves are rewritten.
@@ -157,6 +165,53 @@
 - Decision: stop brute-force knob tuning and focus on architectural changes.
 
 ## Attempt Log
+- 2026-03-06: Narrowing the tied mixed vector-scatter family.
+- What changed/tested:
+- Started from the tied mixed family:
+- `depth 5 -> write_to_values`
+- `depth 6 -> plain`
+- specialized header pointers
+- wrap-root fusion
+- full tree/hash/scatter writeback
+- Then tested:
+- `SPECIALIZE_FOREST_VALUES_PTR + SPECIALIZE_INPUT_VALUES_PTR`
+- `SPECIALIZE_FOREST_VALUES_PTR + DERIVE_INPUT_VALUES_PTR_FROM_FOREST_PTR`
+- guarded scatter-writeback offload on / off
+- round-5 gate widths `28`, `29`, `30`
+- broader `write_to_values` placement across depths `{5,6}`
+- Why: once the mixed family tied at `1065`, the last plausible path was to probe for a small local overlap/placement interaction around the same graph.
+- Result:
+- `SPECIALIZE_FOREST_VALUES_PTR + SPECIALIZE_INPUT_VALUES_PTR` with the mixed family -> correctness-valid `1065`, `11699` ops, `load=1999`, `alu=11834`, `valu=6013`.
+- `SPECIALIZE_FOREST_VALUES_PTR + DERIVE_INPUT_VALUES_PTR_FROM_FOREST_PTR` + guarded writeback offload + `gate {5:29}` -> correctness-valid `1065`, `11702` ops, `load=1999`, `alu=11893`, `valu=6006`.
+- `gate {5:28}` and `{5:30}` on the same family also tie at `1065`.
+- Allowing `write_to_values` on both depths `{5,6}` with guarded offload also ties at `1065`.
+- Decision: keep the scaffolding, but treat the mixed family as locally exhausted. Multiple nearby variants converge to the same `1065` floor.
+
+- 2026-03-06: Chunked deep-round partial round-major tiling retest.
+- What changed/tested:
+- Added `ROUND_MAJOR_TILE_RANGE` and tested it on the strongest mixed family for:
+- tile `5..6`
+- tile `5`
+- tile `6`
+- external-inspired `MAX_CONCURRENT_GROUPS=17`, tile `0..12`
+- Why: import the public tile/flat-stream idea in the narrowest way that preserves the current group-cap model.
+- Result:
+- tile `5..6` -> `1092`
+- tile `5` -> `1086`
+- tile `6` -> `1093`
+- `17 / 0..12` style point -> `1146`
+- Decision: keep disabled. This direction is decisively non-competitive on the current branch.
+
+- 2026-03-06: Deep-round index-update decomposition.
+- What changed/tested:
+- Added `DECOMPOSE_INDEX_UPDATE_DEPTHS` so `new_index = 2*index + branch_bit` can be lowered as two offloadable vector adds on selected depths.
+- Tested it on the strongest mixed family for depths `{5,6}` and `{5,6,7,8,9}`.
+- Why: the tied family has lower ALU pressure than baseline, so moving deep-round tail work off VALU looked plausible.
+- Result:
+- depths `{5,6}` -> `1068`
+- depths `{5,6,7,8,9}` -> `1076`
+- Decision: keep disabled. This raises total tail work too much.
+
 - 2026-03-06: Decomposed deep-round index update (`2*index + branch_bit`) into vector adds.
 - What changed/tested:
 - Added `DECOMPOSE_INDEX_UPDATE_DEPTHS` so selected depths replace the single VALU `multiply_add` in `_emit_index_update()` with two offloadable vector adds.
