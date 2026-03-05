@@ -103,6 +103,9 @@
 - adding the narrow pointer-derivation rewrite on top of the same depth-5 vector-scatter family reaches `load=2000`, `alu=12003`, `valu=5994`, `flow=785`, `store=32`, `11908 ops`, but still measures `1067` cycles.
 - Extending vector scatter to depths `{5,6}` can push ALU fully below the old `12000` target (`alu=11955`, `load=2000`, `valu=6000`), yet still remains at `1068`.
 - Implication: this reopened vector-scatter family is no longer blocked by static slot counts alone; its remaining cap is schedule overlap / dependency shape, not just raw `load` or `alu` totals.
+- New dependency-shape lead inside that family:
+- each vector-scatter combine waits on an all-or-nothing bundle of eight scalar `_scat_load_*` ops, so interleaving those loads across unrelated groups/rounds can stretch the combine span even when total load-slot pressure is already near-optimal.
+- Implication: a local scheduler heuristic that batches sibling scatter loads together, without globally biasing the ready queue toward loads, is worth testing before giving up on the reopened vector-scatter architecture.
 - New fusion lead from that reopened family:
 - the generic stage-5 fusion path paid for deep-round repair too late (`idx_unbias` + post-scatter bias-fix), but the specific `round 4 -> round 5` transition has only one flipped branch bit and depth-5 is a pure scatter round in the current near-win family.
 - That enables a narrower critical-path rewrite: skip stage-5 const only on round `4`, then in round `5` repair `values` before the scatter combine (`values ^ const5`) so the repair can overlap with depth-5 loads, while correcting the depth-5 address with the known one-bit xor mask.
@@ -110,6 +113,16 @@
 - The narrow `round 4 -> round 5` fusion did not survive contact with the scheduler:
 - even with pointer-derivation, wrap-root, full writeback, and the reopened depth-5/6 vector-scatter family, the pre-bias repair path regressed badly (`1090-1092` cycles) and pushed `valu` back above `6000`.
 - Implication: the remaining limiter in the reopened vector-scatter family is not just where the repair op sits on the depth-5 chain; skipping stage-5 const before the deep rounds still perturbs overlap enough to lose far more than it saves.
+- The local scatter-load batching heuristic is also a dead end:
+- forcing the scheduler to keep sibling `_scat_load_*` ops together regressed both the baseline (`1109`) and the reopened vector-scatter near-win (`1099`), despite leaving slot totals close to the original families.
+- Implication: the scheduler’s existing global priority/interleave balance is more important than tightly finishing individual scatter batches; any future dependency-shape rewrite has to preserve that cross-engine ordering.
+- New critical-path fusion lead after that failure:
+- for the normal stage-5 hash (`out = (a ^ C5) ^ (a >> 16)`), the branch bit can be derived from stage-5 intermediates without waiting for the final output value:
+- `out % 2 = 1` exactly when `lsb(a) == lsb(a >> 16)`.
+- That means the next-round branch/index update can potentially start from the stage-4 output and the stage-5 shift result while the final stage-5 combine is still being scheduled, which is a real tail-shortening change rather than another slot-only rewrite.
+- The selective stage-5 branch-hint path still loses:
+- limiting the branch-hint rewrite to the exact reopened vector-scatter rounds (`round 5` alone, or `rounds 5/6`) reduced the blow-up versus the global version, but the best point still regressed to `1068`.
+- Implication: the extra offloadable parity/equality ops cost more than the tail overlap they recover; this branch-bit fusion family is not competitive on the current scheduler/ISA.
 - Deep tree traversal is the main load hotspot:
 - Depths `5-10` use scatter path and contribute most scalar `load`+`alu` tree ops.
 - New allocator/scheduler finding on the hash-temp reuse path:
@@ -131,6 +144,33 @@
 - Decision: stop brute-force knob tuning and focus on architectural changes.
 
 ## Attempt Log
+- 2026-03-05: Selective early stage-5 branch-bit fusion.
+- What changed/tested:
+- Added a new branch-hint path that derives the next branch bit from stage-5 intermediates (`stage4_value` and `stage4_value >> 16`) instead of waiting for the final hash output.
+- After the global version regressed badly, narrowed it with `EARLY_STAGE5_BRANCH_HINT_ROUNDS` and tested only:
+- `round 5`
+- `rounds 5 and 6`
+- on the strongest reopened vector-scatter families.
+- Why: this changes the round tail directly by allowing branch/index work to start before the final stage-5 combine completes.
+- Result:
+- Global path was catastrophic: baseline `1181` cycles, reopened vector-scatter family `1173`.
+- Selective `round 5` on the strongest `depth {5,6}` vector-scatter family -> `1068`, `11764` ops, `load=2000`, `alu=12067`, `valu=6048`.
+- Selective `rounds {5,6}` on the same family -> `1075`, `11828` ops, `valu=6112`.
+- Selective `round 5` on the depth-5-only near-win -> `1068`, `11972` ops, `load=2000`, `alu=12123`, `valu=6043`.
+- Decision: revert / keep disabled. The parity/equality branch-hint work is too expensive to beat the existing tail.
+
+- 2026-03-05: Local scheduler batching of sibling scatter loads.
+- What changed/tested:
+- Added `PREFER_SCATTER_LOAD_BATCHING` so the scheduler can keep sibling `_scat_load_*` ops from the same scatter batch together when making a local load-vs-load choice, while leaving cross-engine heap order unchanged.
+- Tested it on:
+- the default `1065` baseline
+- the strongest reopened vector-scatter family (`depths {5,6}`, no round gates, derived `inp_values_ptr`, wrap-root, full tree/hash/scatter writeback)
+- Why: each vector-scatter combine waits on all eight scalar loads, so compressing those load windows looked like a plausible way to shorten the combine span without changing emitted slot totals.
+- Result:
+- `PREFER_SCATTER_LOAD_BATCHING=True` on baseline -> `1109` cycles, `12375` ops, slots `load=2001`, `flow=785`, `alu=12162`, `valu=6005`, `store=32`.
+- `PREFER_SCATTER_LOAD_BATCHING=True` on the reopened vector-scatter family -> `1099` cycles, `11700` ops, slots `load=2000`, `flow=785`, `alu=12035`, `valu=5988`, `store=32`.
+- Decision: revert / keep disabled. Tightening individual scatter batches harms the scheduler’s broader overlap badly enough that it is not competitive.
+
 - 2026-03-05: Narrow round-4 -> round-5 stage-5 fusion for the reopened vector-scatter family.
 - What changed/tested:
 - Added a one-round fusion path that skips stage-5 const only on round `4`, then repairs round `5` by:
