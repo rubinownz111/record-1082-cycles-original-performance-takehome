@@ -21,11 +21,41 @@
 
 ## Current Baseline
 - Command: `python3 tests/submission_tests.py`
-- Result: `1064` cycles, correctness passing.
-- Kernel stats: `11893 ops`, peak scratch `1497/1536`.
-- Note: the currently checked-out worktree on `2026-03-06` re-validates at this `1064` baseline. Older `1065-1082` entries below are useful historical context from earlier architecture exploration, but they do not describe the present file state.
+- Result: `1063` cycles, correctness passing.
+- Kernel stats: `11892 ops`, peak scratch `1465/1536`.
+- Note: the currently checked-out worktree on `2026-03-06` re-validates at this `1063` baseline. Older `1064-1082` entries below are useful historical context from earlier architecture exploration, but they do not describe the present file state.
 
 ## Findings So Far
+- The current checked-out best is now a one-line shallow-mask change:
+- adding `g=13` to `DEPTH_4_VSELECT_GROUPS_BY_ROUND[4]` is correctness-valid on the exact `python3 tests/submission_tests.py` command and measures `1063` cycles.
+- Measured shape at the promoted win:
+- `11892 ops`
+- `load=1991`
+- `flow=798`
+- `alu=11964`
+- `valu=5999`
+- `store=32`
+- peak scratch `1465/1536`
+- Implication: the first break below `1064` came from spending a little more shallow flow/vselect work in round `4` to delete `8` real loads from the schedule. The current architecture still appears to be governed more by overlap shape than by raw ALU totals.
+- The round-4 depth-4 win is a one-group optimum, not an obvious multi-group family:
+- all four best single additions (`g=13/16/19/14`) stayed correctness-valid across an 8-seed recheck at `1063`, but every tested pair regressed to `1067-1070`.
+- Pair additions continue to reduce `load` (`1991 -> 1983`) and scratch, but they also push `flow` up to `810` and typically add enough extra shallow work to lose the schedule win.
+- Implication: the winning move is very narrow. The current architecture appears to want exactly one more round-4 depth-4 vselect group, not a broader shallow-mask expansion.
+- The first sub-`1064` lead on the current winner comes from the round-4 depth-4 vselect mask, not from gates or deep-path placement:
+- single-group additions to `DEPTH_4_VSELECT_GROUPS_BY_ROUND[4]` for `g in {13, 16, 19, 14}` all build/schedule at `1063` and passed initial correctness validation.
+- Best currently seen points from that sweep:
+- add `g=13` or `g=16` -> `1063`, `11892 ops`, `load=1991`, `flow=798`, `alu=11964`, `valu=5999`, peak scratch `1465/1536`.
+- add `g=19` -> `1063`, `11892 ops`, `load=1991`, `flow=798`, `alu=11980`, `valu=5997`, peak scratch `1465/1536`.
+- add `g=14` -> `1063`, `11892 ops`, `load=1991`, `flow=798`, `alu=11988`, `valu=5996`, peak scratch `1465/1536`.
+- Implication: on the depth-6-only winner, one more round-4 shallow vselect group can trade `load` for `flow` with a net schedule win. This is the first evidence that the current shallow masks really were tuned for the older `1065` family rather than the new `1064` architecture.
+- The `1064` winner does not want the old multi-round gate maps back:
+- adding round `7/9/10` windows on top of the current `ROUND_GATE_WINDOW_BY_ROUND={5:30}` configuration is correctness-valid, and it lowers peak scratch materially (`1497 -> 1399-1503`) while often lowering `valu` to `5986-6001`, but every tested map regresses to `1066-1067`.
+- Pairing those same gate maps with `SPECIALIZE_INPUT_VALUES_PTR=True` simply shifts `alu` down by `8` and `valu` up by `1` at the same regressed cycle counts.
+- Implication: on the depth-6-only winner, the extra late-round gates are still damaging overlap even when static scratch / `valu` pressure improves; the winning point remains a narrow single-round gate, not a revived `5+7+9+10` map.
+- The current `1064` winner has additional local configuration slack that was not previously exercised:
+- replacing derived input-pointer setup with `SPECIALIZE_INPUT_VALUES_PTR=True` is correctness-valid and trims `alu` slightly (`11884 -> 11876`) while adding `1` `valu`, but it still ties at `1064`.
+- swapping depth-6 vector-scatter placement from `write_to_values` to `SCATTER_VECTOR_XOR_INPLACE_DEPTHS={6}` is also correctness-valid and schedule-identical (`1064`, same ops/slots/peak scratch).
+- Implication: on the depth-6-only winning architecture, these setup / scatter-placement micro-choices are now overlap-neutral equivalence points rather than clear regressions. Future wins may need combinations with a different gate or shallow-mask shape instead of treating these flags as individually decisive.
 - Tail-only shallow stage-5 fusion is not a safe extension of the wrap-root idea:
 - even though it drives `valu` much lower (`5922` tail-only, `5881` wrap+tail), both variants fail correctness.
 - Implication: after round `11`, shallow rounds still depend on bias state in a way that is not handled by the simple “consecutive full-bias prefix” model; wrap-root remains the only currently safe narrow stage-5 fusion.
@@ -191,6 +221,99 @@
 - Decision: stop brute-force knob tuning and focus on architectural changes.
 
 ## Attempt Log
+- 2026-03-06: Promoted the first `1063` mask win and re-validated with the exact submission test command.
+- What changed/tested:
+- Updated the default `DEPTH_4_VSELECT_GROUPS_BY_ROUND[4]` mask to add `g=13`, leaving the rest of the `1064` depth-6-only winning architecture unchanged.
+- Ran `python3 tests/submission_tests.py` on that new default.
+- Why: after the focused follow-up, `g=13` was the simplest fully-validated `1063` single-group round-4 mask addition and matched the best measured slot shape in the new family.
+- Result:
+- `python3 tests/submission_tests.py` -> correctness pass at `1063` cycles.
+- `11892 ops`, slots `load=1991`, `flow=798`, `alu=11964`, `valu=5999`, `store=32`, peak scratch `1465/1536`.
+- Decision: keep and promote as the new baseline.
+
+- 2026-03-06: Focused follow-up on the new `1063` round-4 mask family.
+- What changed/tested:
+- Re-validated the four best single additions to `DEPTH_4_VSELECT_GROUPS_BY_ROUND[4]` (`g=13`, `16`, `19`, `14`) across 8 randomized correctness seeds each.
+- Also tested all 2-group combinations among those four candidates, plus local companions on the best single (`g=13`) with:
+- `SPECIALIZE_INPUT_VALUES_PTR=True`
+- `SCATTER_VECTOR_XOR_INPLACE_DEPTHS={6}`
+- both together
+- Why: once the single-flip sweep found the first `1063` points, the next questions were whether the win was stable under deeper correctness checking, whether it extended to broader shallow-mask changes, and whether the newly discovered tie-point flags could stack on top of it.
+- Result:
+- All four single-group additions stayed correctness-valid at `1063` across 8 seeds.
+- `g=13` -> `1063`, pass, `11892 ops`, `load=1991`, `flow=798`, `alu=11964`, `valu=5999`, peak scratch `1465/1536`.
+- `g=16` -> same measured shape as `g=13`.
+- `g=19` -> `1063`, pass, `alu=11980`, `valu=5997`.
+- `g=14` -> `1063`, pass, `alu=11988`, `valu=5996`.
+- All tested 2-group combinations regressed despite lower `load` / scratch:
+- best pair (`g=13,19`) -> `1067`, `11891 ops`, `load=1983`, `flow=810`, `alu=12012`, `valu=5995`, peak scratch `1417/1536`.
+- worst pair in this set (`g=16,19`) -> `1070`, `alu=11884`, `valu=6011`.
+- Local tie-point companions did not improve the winner further:
+- `g=13 + SPECIALIZE_INPUT_VALUES_PTR=True` -> `1063`, `alu=11956`, `valu=6000`.
+- `g=13 + SCATTER_VECTOR_XOR_INPLACE_DEPTHS={6}` -> `1063`, same shape as plain `g=13`.
+- both together -> `1063`, `alu=11956`, `valu=6000`.
+- Decision: promote a single-group round-4 depth-4 mask addition next and validate it with the exact submission test command. Treat multi-group expansion around this family as a dead end.
+
+- 2026-03-06: Single-flip shallow vselect-mask sweep on the `1064` winner.
+- What changed/tested:
+- On the active depth-6-only `1064` defaults, ran a structured single-group-flip sweep across the shallow mask surfaces that still define the current architecture:
+- `DEPTH_3_VSELECT_GROUPS_BY_ROUND[3]`
+- `DEPTH_4_VSELECT_GROUPS_BY_ROUND[4]`
+- the base depth-3 partition (via `DEPTH_3_VSELECT_GROUPS_OVERRIDE`)
+- the base depth-4 partition (via `DEPTH_4_VSELECT_GROUPS_OVERRIDE`)
+- Why: the current shallow masks were tuned around older `1065` families, so the next plausible local win was that the `1064` depth-6-only architecture might want a slightly different shallow scatter/vselect split even if gates and deep placement stayed fixed.
+- Result:
+- Only the round-4 depth-4 override produced improvements below baseline.
+- Best points from the sweep:
+- add `g=13` to `DEPTH_4_VSELECT_GROUPS_BY_ROUND[4]` -> `1063` cycles, pass on initial validation, `11892 ops`, slots `load=1991`, `flow=798`, `alu=11964`, `valu=5999`, `store=32`, peak scratch `1465/1536`.
+- add `g=16` -> `1063`, initial validation pass, same ops / `load` / `flow` / `alu` / `valu` / peak scratch as `g=13`.
+- add `g=19` -> `1063`, initial validation pass, `alu=11980`, `valu=5997`, same `ops/load/flow/peak`.
+- add `g=14` -> `1063`, initial validation pass, `alu=11988`, `valu=5996`, same `ops/load/flow/peak`.
+- Best non-winning points on other surfaces:
+- `DEPTH_3_VSELECT_GROUPS_BY_ROUND[3]` best single flip (`g=30`) -> `1067`.
+- base depth-3 partition best single flip (`g=1`) -> `1068`.
+- base depth-4 partition best single flip (`g=13`) -> `1067`.
+- Decision: follow up immediately. This is the first real lead below `1064`, but it still needs stronger confirmation and local combination testing before promoting a new default.
+
+- 2026-03-06: Multi-round gate retest on the `1064` winner.
+- What changed/tested:
+- Starting from the active depth-6-only `1064` defaults, tested multi-round gate maps that add old late-round windows on top of `ROUND_GATE_WINDOW_BY_ROUND={5:30}`:
+- `{5:30,7:28}`
+- `{5:30,9:24,10:28}`
+- `{5:30,7:28,10:28}`
+- `{5:30,7:28,9:24}`
+- `{5:30,7:28,9:24,10:28}`
+- `{5:30,7:28,9:26,10:28}`
+- `{5:30,7:26,9:26,10:28}`
+- Re-ran the same map set with `SPECIALIZE_INPUT_VALUES_PTR=True` replacing derived input-pointer setup.
+- Why: the new winner only gates round `5`, so the obvious follow-up was to test whether the historically strong `7/9/10` windows become helpful again on the lower-load depth-6-only architecture, especially with the newly discovered specialized-input-pointer tie-point.
+- Result:
+- Baseline `gate {5:30}` re-check -> `1064` cycles, pass, `11893 ops`, slots `load=1999`, `flow=786`, `alu=11884`, `valu=6007`, `store=32`, peak scratch `1497/1536`.
+- Best non-specialized regressions:
+- `{5:30,7:28}` -> `1066`, pass, `11897 ops`, `alu=12040`, `valu=5988`, peak scratch `1458/1536`.
+- `{5:30,9:24,10:28}` -> `1066`, pass, `11905 ops`, `alu=12064`, `valu=5986`, peak scratch `1399/1536`.
+- `{5:30,7:28,9:24}` -> `1066`, pass, `11905 ops`, `alu=11944`, `valu=6001`, peak scratch `1503/1536`.
+- Full old-map-style points stayed at `1067`:
+- `{5:30,7:28,9:24,10:28}` -> `1067`, `11909 ops`, `alu=12012`, `valu=5993`.
+- `{5:30,7:28,9:26,10:28}` -> `1067`, `11907 ops`, `alu=12010`, `valu=5993`.
+- `{5:30,7:26,9:26,10:28}` -> `1067`, `11909 ops`, `alu=12012`, `valu=5993`.
+- `SPECIALIZE_INPUT_VALUES_PTR=True` preserved the same cycle outcomes across the entire sweep; it only shifted slot totals by roughly `alu -8`, `valu +1`.
+- Decision: keep `ROUND_GATE_WINDOW_BY_ROUND={5:30}` as the default. Multi-round gating remains a dead end on the current winner.
+
+- 2026-03-06: Untested local flag swaps on the `1064` depth-6-only winner.
+- What changed/tested:
+- Starting from the active `1064` defaults (`PREFER_FLOW_CONST=True`, depth-6-only vector scatter with `write_to_values`, specialized forest pointer + derived input pointer, wrap-root fusion, full tree/hash/scatter writeback, hash temp reuse, `ROUND_GATE_WINDOW_BY_ROUND={5:30}`), tested:
+- `SPECIALIZE_INPUT_VALUES_PTR=True` replacing `DERIVE_INPUT_VALUES_PTR_FROM_FOREST_PTR=True`
+- `SCATTER_VECTOR_XOR_INPLACE=True` with `SCATTER_VECTOR_XOR_INPLACE_DEPTHS={6}` replacing depth-6 `write_to_values`
+- the combination of both changes together
+- Why: these were the most obvious untested local degrees of freedom on the first `1064` architecture, and both had been either regressive or unmeasured only on older `1065` families.
+- Result:
+- Baseline re-check in the same harness -> `1064` cycles, pass, `11893 ops`, slots `load=1999`, `flow=786`, `alu=11884`, `valu=6007`, `store=32`, peak scratch `1497/1536`.
+- `SPECIALIZE_INPUT_VALUES_PTR=True` -> `1064` cycles, pass, `11893 ops`, slots `load=1999`, `flow=786`, `alu=11876`, `valu=6008`, `store=32`, peak scratch `1497/1536`.
+- `SCATTER_VECTOR_XOR_INPLACE_DEPTHS={6}` -> `1064` cycles, pass, `11893 ops`, slots `load=1999`, `flow=786`, `alu=11884`, `valu=6007`, `store=32`, peak scratch `1497/1536`.
+- both together -> `1064` cycles, pass, `11893 ops`, slots `load=1999`, `flow=786`, `alu=11876`, `valu=6008`, `store=32`, peak scratch `1497/1536`.
+- Decision: keep the current default unchanged for now. These are useful tie-points and make good companions for future gate/mask experiments, but neither change earns a standalone promotion.
+
 - 2026-03-06: First correctness-valid break below `1065`.
 - What changed/tested:
 - Tested a depth-6-only vector-scatter family with:
