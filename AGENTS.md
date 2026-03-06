@@ -26,6 +26,27 @@
 - Note: the currently checked-out worktree on `2026-03-06` re-validates at this `1063` baseline. Older `1064-1082` entries below are useful historical context from earlier architecture exploration, but they do not describe the present file state.
 
 ## Findings So Far
+- The full round-4 swap grid confirms there is no hidden sub-`1063` swap winner:
+- among all one-for-one swaps on `DEPTH_4_VSELECT_GROUPS_BY_ROUND[4]`, the only `1063` points are the already-known equivalent singles:
+- `swap 13 -> 16`
+- `swap 13 -> 19`
+- `swap 13 -> 14`
+- Implication: swap space does not open a new architecture family; it only shows that the `g=13/16/19/14` single-add winners are interchangeable local optima of the same shape.
+- The `1063` round-4 single winners are flat under the remaining safe companion flags:
+- pairing any of `g=13/16/19/14` with `SPECIALIZE_INPUT_VALUES_PTR=True` and/or depth-6 `SCATTER_VECTOR_XOR_INPLACE` keeps the schedule exactly at `1063`.
+- Implication: there is no hidden `1062` in the current narrow round-4 family from the known setup / scatter-placement tie points.
+- Round-4 swap neighborhoods are not obviously extending the `1063` win:
+- a targeted swap search over the least-bad remove side (`g=18/12/15/0/3/28`) and the most promising add side (`g=6/19/14/16/17/9/23/2`) found no improvement below `1065`.
+- Best observed swap points:
+- `swap 18 -> 9` -> `1065`, `11892 ops`, `load=1991`, `flow=798`, `alu=11916`, `valu=6005`, peak scratch `1465/1536`.
+- `swap 15 -> 9` -> `1065`, `alu=12060`, `valu=5987`, peak scratch `1409/1536`.
+- Implication: keeping round-4 mask cardinality constant while exchanging one existing group for one non-member does not look competitive in the most promising local neighborhood. The `g=13` addition still appears to be the right shape.
+- The promoted `g=13` round-4 mask is a local optimum under all single round-4 flips:
+- every one-group add/remove around the new default regresses or ties; no single-flip neighbor beats `1063`.
+- Best neighbors only undo part of the win:
+- `remove g13` -> back to the prior `1064` baseline.
+- `remove g18` -> also `1064`, but with a different shape (`alu=11980`, `valu=5995`, peak scratch `1473/1536`).
+- Implication: the next plausible shallow-mask search is a swap neighborhood (remove one existing round-4 group while adding one non-member), not another simple add/remove perturbation.
 - The current checked-out best is now a one-line shallow-mask change:
 - adding `g=13` to `DEPTH_4_VSELECT_GROUPS_BY_ROUND[4]` is correctness-valid on the exact `python3 tests/submission_tests.py` command and measures `1063` cycles.
 - Measured shape at the promoted win:
@@ -221,6 +242,53 @@
 - Decision: stop brute-force knob tuning and focus on architectural changes.
 
 ## Attempt Log
+- 2026-03-06: Full round-4 swap grid and companion-flag matrix on the `1063` family.
+- What changed/tested:
+- Completed the full one-for-one swap grid on `DEPTH_4_VSELECT_GROUPS_BY_ROUND[4]` around the promoted `g=13` default.
+- Also tested the four known `1063` single-group winners (`g=13/16/19/14`) against the remaining correctness-valid local companions:
+- `SPECIALIZE_INPUT_VALUES_PTR=True`
+- depth-6 `SCATTER_VECTOR_XOR_INPLACE`
+- both together
+- Why: after the targeted swap pass and single-flip neighborhood, the remaining low-cost questions were whether the full swap space hid any missed equivalent/better winner, and whether any known tie-point flag could convert a `1063` single into `1062`.
+- Result:
+- Full swap grid:
+- no swap beat `1063`.
+- only three swaps tied it, and all simply replace the promoted `g=13` with another already-known winning single:
+- `swap 13 -> 16` -> `1063`, pass, `11892 ops`, `load=1991`, `flow=798`, `alu=11964`, `valu=5999`, peak scratch `1465/1536`.
+- `swap 13 -> 19` -> `1063`, pass, `alu=11980`, `valu=5997`.
+- `swap 13 -> 14` -> `1063`, pass, `alu=11988`, `valu=5996`.
+- Companion-flag matrix:
+- every tested combination on `g=13/16/19/14` stayed exactly `1063`.
+- best static companion point was `g=13` or `g=16` with `SPECIALIZE_INPUT_VALUES_PTR=True` (with or without depth-6 inplace), still `1063`, `alu=11956`, `valu=6000`.
+- Decision: keep the current `g=13` default. The narrow round-4 winner family appears fully exhausted under the known safe local companions.
+
+- 2026-03-06: Targeted round-4 swap search around the `1063` mask.
+- What changed/tested:
+- Evaluated a pruned constant-cardinality swap neighborhood on `DEPTH_4_VSELECT_GROUPS_BY_ROUND[4]` using the most promising remove side from the single-flip pass (`g=18/12/15/0/3/28`) and the most promising add side from the prior sweep (`g=6/19/14/16/17/9/23/2`).
+- Why: after the full single-flip neighborhood showed `g=13` was locally optimal under one-step adds/removes, the next plausible round-4 search was a swap that preserves mask size while changing which shallow group pays the extra flow/vselect cost.
+- Result:
+- No swap beat `1063`; no swap even tied it.
+- Best swaps:
+- `swap 18 -> 9` -> `1065`, `11892 ops`, `load=1991`, `flow=798`, `alu=11916`, `valu=6005`, peak scratch `1465/1536`.
+- `swap 15 -> 9` -> `1065`, `11892 ops`, `alu=12060`, `valu=5987`, peak scratch `1409/1536`.
+- `swap 15 -> 6` -> `1066`, `alu=11908`, `valu=6006`.
+- `swap 3 -> 6` -> `1066`, `alu=11924`, `valu=6004`.
+- Decision: keep the promoted `g=13` mask. Round-4 swap space looks non-competitive in the best local neighborhood.
+
+- 2026-03-06: Single-flip neighborhood search around the promoted `1063` round-4 mask.
+- What changed/tested:
+- Starting from the new default round-4 depth-4 mask (which already includes `g=13`), evaluated every single add/remove on `DEPTH_4_VSELECT_GROUPS_BY_ROUND[4]`.
+- Why: after promoting the first `1063` win, the fastest way to check whether it was a true local optimum was to search all one-step neighbors before spending more time on larger combinatorics.
+- Result:
+- No single-flip neighbor beat `1063`.
+- Best results:
+- `remove g13` -> `1064`, correctness pass, `11893 ops`, `load=1999`, `flow=786`, `alu=11884`, `valu=6007`, peak scratch `1497/1536`.
+- `remove g18` -> `1064`, correctness pass, `11893 ops`, `load=1999`, `flow=786`, `alu=11980`, `valu=5995`, peak scratch `1473/1536`.
+- Best add-side neighbor:
+- `add g6` -> `1065`, `11891 ops`, `load=1983`, `flow=810`, `alu=12052`, `valu=5990`, peak scratch `1401/1536`.
+- Other previously promising adds (`g=19`, `g=14`, `g=16`) now regress as second additions (`1067-1068`).
+- Decision: keep the `g=13` default unchanged. Move next to swap-style round-4 mask neighborhoods rather than further single flips.
+
 - 2026-03-06: Promoted the first `1063` mask win and re-validated with the exact submission test command.
 - What changed/tested:
 - Updated the default `DEPTH_4_VSELECT_GROUPS_BY_ROUND[4]` mask to add `g=13`, leaving the rest of the `1064` depth-6-only winning architecture unchanged.
